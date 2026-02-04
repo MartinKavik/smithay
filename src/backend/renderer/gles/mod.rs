@@ -136,12 +136,26 @@ fn should_log_cache() -> bool {
 
 static GLES_TEXTURE_LIVE: AtomicUsize = AtomicUsize::new(0);
 static GLES_TEXTURE_BYTES: AtomicUsize = AtomicUsize::new(0);
+static GLES_TEXTURE_RAW_LIVE: AtomicUsize = AtomicUsize::new(0);
+static GLES_TEXTURE_MEM_LIVE: AtomicUsize = AtomicUsize::new(0);
+static GLES_TEXTURE_EGL_LIVE: AtomicUsize = AtomicUsize::new(0);
+static GLES_TEXTURE_DMABUF_LIVE: AtomicUsize = AtomicUsize::new(0);
+static GLES_TEXTURE_OFFSCREEN_LIVE: AtomicUsize = AtomicUsize::new(0);
 static GLES_RENDERBUFFER_LIVE: AtomicUsize = AtomicUsize::new(0);
 static GLES_RENDERBUFFER_BYTES: AtomicUsize = AtomicUsize::new(0);
 static GLES_BUFFER_LIVE: AtomicUsize = AtomicUsize::new(0);
 static GLES_EGLIMAGE_LIVE: AtomicUsize = AtomicUsize::new(0);
 static GLES_MAPPING_LIVE: AtomicUsize = AtomicUsize::new(0);
 static GLES_MAPPING_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Copy, Clone, Debug)]
+pub(super) enum TextureOrigin {
+    Raw,
+    Mem,
+    EglBuffer,
+    Dmabuf,
+    Offscreen,
+}
 
 fn estimate_bytes_from_internal_format(
     format: Option<ffi::types::GLenum>,
@@ -174,24 +188,40 @@ fn estimate_bytes_from_gl_read(
 }
 
 pub(super) fn track_texture_alloc(
+    origin: TextureOrigin,
     format: Option<ffi::types::GLenum>,
     size: Size<i32, BufferCoord>,
     egl_images: usize,
 ) {
     GLES_TEXTURE_LIVE.fetch_add(1, Ordering::Relaxed);
     GLES_TEXTURE_BYTES.fetch_add(estimate_bytes_from_internal_format(format, size), Ordering::Relaxed);
+    match origin {
+        TextureOrigin::Raw => GLES_TEXTURE_RAW_LIVE.fetch_add(1, Ordering::Relaxed),
+        TextureOrigin::Mem => GLES_TEXTURE_MEM_LIVE.fetch_add(1, Ordering::Relaxed),
+        TextureOrigin::EglBuffer => GLES_TEXTURE_EGL_LIVE.fetch_add(1, Ordering::Relaxed),
+        TextureOrigin::Dmabuf => GLES_TEXTURE_DMABUF_LIVE.fetch_add(1, Ordering::Relaxed),
+        TextureOrigin::Offscreen => GLES_TEXTURE_OFFSCREEN_LIVE.fetch_add(1, Ordering::Relaxed),
+    };
     if egl_images > 0 {
         GLES_EGLIMAGE_LIVE.fetch_add(egl_images, Ordering::Relaxed);
     }
 }
 
 pub(super) fn track_texture_drop(
+    origin: TextureOrigin,
     format: Option<ffi::types::GLenum>,
     size: Size<i32, BufferCoord>,
     egl_images: usize,
 ) {
     GLES_TEXTURE_LIVE.fetch_sub(1, Ordering::Relaxed);
     GLES_TEXTURE_BYTES.fetch_sub(estimate_bytes_from_internal_format(format, size), Ordering::Relaxed);
+    match origin {
+        TextureOrigin::Raw => GLES_TEXTURE_RAW_LIVE.fetch_sub(1, Ordering::Relaxed),
+        TextureOrigin::Mem => GLES_TEXTURE_MEM_LIVE.fetch_sub(1, Ordering::Relaxed),
+        TextureOrigin::EglBuffer => GLES_TEXTURE_EGL_LIVE.fetch_sub(1, Ordering::Relaxed),
+        TextureOrigin::Dmabuf => GLES_TEXTURE_DMABUF_LIVE.fetch_sub(1, Ordering::Relaxed),
+        TextureOrigin::Offscreen => GLES_TEXTURE_OFFSCREEN_LIVE.fetch_sub(1, Ordering::Relaxed),
+    };
     if egl_images > 0 {
         GLES_EGLIMAGE_LIVE.fetch_sub(egl_images, Ordering::Relaxed);
     }
@@ -243,10 +273,15 @@ pub(super) fn track_mapping_drop(
     GLES_MAPPING_BYTES.fetch_sub(estimate_bytes_from_gl_read(format, layout, size), Ordering::Relaxed);
 }
 
-fn resource_stats_snapshot() -> (usize, usize, usize, usize, usize, usize, usize, usize) {
+fn resource_stats_snapshot() -> (usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize) {
     (
         GLES_TEXTURE_LIVE.load(Ordering::Relaxed),
         GLES_TEXTURE_BYTES.load(Ordering::Relaxed),
+        GLES_TEXTURE_RAW_LIVE.load(Ordering::Relaxed),
+        GLES_TEXTURE_MEM_LIVE.load(Ordering::Relaxed),
+        GLES_TEXTURE_EGL_LIVE.load(Ordering::Relaxed),
+        GLES_TEXTURE_DMABUF_LIVE.load(Ordering::Relaxed),
+        GLES_TEXTURE_OFFSCREEN_LIVE.load(Ordering::Relaxed),
         GLES_RENDERBUFFER_LIVE.load(Ordering::Relaxed),
         GLES_RENDERBUFFER_BYTES.load(Ordering::Relaxed),
         GLES_BUFFER_LIVE.load(Ordering::Relaxed),
@@ -1036,6 +1071,11 @@ impl GlesRenderer {
             let (
                 gles_textures_live,
                 gles_textures_bytes,
+                gles_textures_raw_live,
+                gles_textures_mem_live,
+                gles_textures_egl_live,
+                gles_textures_dmabuf_live,
+                gles_textures_offscreen_live,
                 gles_renderbuffers_live,
                 gles_renderbuffers_bytes,
                 gles_buffers_live,
@@ -1053,6 +1093,11 @@ impl GlesRenderer {
                     after_buffers,
                     gles_textures_live,
                     gles_textures_bytes,
+                    gles_textures_raw_live,
+                    gles_textures_mem_live,
+                    gles_textures_egl_live,
+                    gles_textures_dmabuf_live,
+                    gles_textures_offscreen_live,
                     gles_renderbuffers_live,
                     gles_renderbuffers_bytes,
                     gles_buffers_live,
@@ -1173,6 +1218,7 @@ impl ImportMemWl for GlesRenderer {
                             false,
                             (width, height).into(),
                             None,
+                            TextureOrigin::Mem,
                             self.gles_cleanup().sender.clone(),
                         ));
                         if let Some(cache) = surface_lock.as_mut() {
@@ -1353,6 +1399,7 @@ impl ImportMem for GlesRenderer {
                 flipped,
                 size,
                 None,
+                TextureOrigin::Mem,
                 self.gles_cleanup().sender.clone(),
             )
         }));
@@ -1498,6 +1545,7 @@ impl ImportEgl for GlesRenderer {
             egl.y_inverted,
             egl.size,
             Some(egl.into_images()),
+            TextureOrigin::EglBuffer,
             self.gles_cleanup().sender.clone(),
         )));
 
@@ -1540,6 +1588,7 @@ impl ImportDma for GlesRenderer {
                 buffer.y_inverted(),
                 buffer.size(),
                 Some(vec![image]),
+                TextureOrigin::Dmabuf,
                 self.gles_cleanup().sender.clone(),
             )));
             self.dmabuf_cache.insert(buffer.weak(), texture.clone());

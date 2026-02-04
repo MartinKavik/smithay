@@ -36,6 +36,7 @@ impl GlesTexture {
             false,
             size,
             None,
+            TextureOrigin::Raw,
             renderer.gles_cleanup().sender.clone(),
         )))
     }
@@ -130,6 +131,7 @@ pub(super) struct GlesTextureInternal {
     pub(super) y_inverted: bool,
     pub(super) size: Size<i32, BufferCoord>,
     pub(super) egl_images: Option<Vec<EGLImage>>,
+    pub(super) origin: TextureOrigin,
     pub(super) destruction_callback_sender: Sender<CleanupResource>,
 }
 unsafe impl Send for GlesTextureInternal {}
@@ -145,10 +147,11 @@ impl GlesTextureInternal {
         y_inverted: bool,
         size: Size<i32, BufferCoord>,
         egl_images: Option<Vec<EGLImage>>,
+        origin: TextureOrigin,
         destruction_callback_sender: Sender<CleanupResource>,
     ) -> Self {
         let egl_images_len = egl_images.as_ref().map(|images| images.len()).unwrap_or(0);
-        track_texture_alloc(format, size, egl_images_len);
+        track_texture_alloc(origin, format, size, egl_images_len);
         Self {
             texture,
             sync,
@@ -158,6 +161,7 @@ impl GlesTextureInternal {
             y_inverted,
             size,
             egl_images,
+            origin,
             destruction_callback_sender,
         }
     }
@@ -166,7 +170,7 @@ impl GlesTextureInternal {
 impl Drop for GlesTextureInternal {
     fn drop(&mut self) {
         let egl_images_len = self.egl_images.as_ref().map(|images| images.len()).unwrap_or(0);
-        track_texture_drop(self.format, self.size, egl_images_len);
+        track_texture_drop(self.origin, self.format, self.size, egl_images_len);
         let _ = self
             .destruction_callback_sender
             .send(CleanupResource::Texture(self.texture));
