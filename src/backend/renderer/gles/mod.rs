@@ -14,8 +14,9 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicPtr, Ordering},
         mpsc::{self, Sender},
-        Arc, Mutex, RwLock, RwLockWriteGuard, TryLockError,
+        Arc, Mutex, OnceLock, RwLock, RwLockWriteGuard, TryLockError,
     },
+    time::{Duration, Instant},
 };
 use tracing::{debug, error, info, info_span, instrument, span, span::EnteredSpan, trace, warn, Level};
 
@@ -81,6 +82,57 @@ enum CleanupResource {
     Sync(ffi::types::GLsync),
 }
 unsafe impl Send for CleanupResource {}
+
+fn env_flag(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(val) => matches!(
+            val.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
+fn hard_purge_enabled() -> bool {
+    static HARD_PURGE: OnceLock<bool> = OnceLock::new();
+    *HARD_PURGE.get_or_init(|| env_flag("HARD_PURGE") || env_flag("SMITHAY_HARD_PURGE"))
+}
+
+fn cache_log_enabled() -> bool {
+    static CACHE_LOG: OnceLock<bool> = OnceLock::new();
+    *CACHE_LOG.get_or_init(|| env_flag("CACHE_LOG") || env_flag("SMITHAY_CACHE_LOG"))
+}
+
+fn cache_log_force_enabled() -> bool {
+    static CACHE_LOG_FORCE: OnceLock<bool> = OnceLock::new();
+    *CACHE_LOG_FORCE.get_or_init(|| {
+        env_flag("CACHE_LOG_FORCE") || env_flag("SMITHAY_CACHE_LOG_FORCE")
+    })
+}
+
+fn cache_log_interval() -> Duration {
+    let ms = std::env::var("CACHE_LOG_INTERVAL_MS")
+        .ok()
+        .or_else(|| std::env::var("SMITHAY_CACHE_LOG_INTERVAL_MS").ok())
+        .and_then(|val| val.parse::<u64>().ok())
+        .unwrap_or(1000);
+    Duration::from_millis(ms.max(1))
+}
+
+fn should_log_cache() -> bool {
+    static LAST_LOG: OnceLock<Mutex<Instant>> = OnceLock::new();
+    let interval = cache_log_interval();
+    let mut last = LAST_LOG
+        .get_or_init(|| Mutex::new(Instant::now() - interval))
+        .lock()
+        .unwrap();
+    if last.elapsed() >= interval {
+        *last = Instant::now();
+        true
+    } else {
+        false
+    }
+}
 
 #[derive(Debug)]
 struct GlesBufferInner {
@@ -795,8 +847,42 @@ impl GlesRenderer {
 
     #[profiling::function]
     fn cleanup(&mut self) {
-        self.dmabuf_cache.retain(|entry, _tex| !entry.is_gone());
-        self.buffers.retain(|buffer| !buffer.0.dmabuf.is_gone());
+        let hard_purge = hard_purge_enabled();
+        let cache_log = cache_log_enabled();
+        let cache_force = cache_log_force_enabled();
+
+        let before_dmabuf = self.dmabuf_cache.len();
+        let before_buffers = self.buffers.len();
+
+        if hard_purge {
+            self.dmabuf_cache.clear();
+            self.buffers.clear();
+        } else {
+            self.dmabuf_cache.retain(|entry, _tex| !entry.is_gone());
+            self.buffers.retain(|buffer| !buffer.0.dmabuf.is_gone());
+        }
+
+        let after_dmabuf = self.dmabuf_cache.len();
+        let after_buffers = self.buffers.len();
+        if cache_log
+            && (hard_purge
+                || cache_force
+                || before_dmabuf != after_dmabuf
+                || before_buffers != after_buffers
+                || should_log_cache())
+        {
+            self.span.in_scope(|| {
+                info!(
+                    hard_purge,
+                    cache_force,
+                    before_dmabuf,
+                    after_dmabuf,
+                    before_buffers,
+                    after_buffers,
+                    "smithay gles cleanup cache stats"
+                );
+            });
+        }
         self.gles_cleanup().cleanup(&self.egl, &self.gl);
     }
 
@@ -911,6 +997,17 @@ impl ImportMemWl for GlesRenderer {
                         });
                         if let Some(cache) = surface_lock.as_mut() {
                             cache.insert(id, new.clone());
+                            if cache_log_enabled() && upload_full && should_log_cache() {
+                                let cache_len = cache.len();
+                                self.span.in_scope(|| {
+                                    info!(
+                                        shm_cache_entries = cache_len,
+                                        width,
+                                        height,
+                                        "smithay shm texture cache insert"
+                                    );
+                                });
+                            }
                         }
                         new
                     }),
@@ -1266,6 +1363,18 @@ impl ImportDma for GlesRenderer {
                 destruction_callback_sender: self.gles_cleanup().sender.clone(),
             }));
             self.dmabuf_cache.insert(buffer.weak(), texture.clone());
+            if cache_log_enabled() && should_log_cache() {
+                let cache_len = self.dmabuf_cache.len();
+                let size = buffer.size();
+                self.span.in_scope(|| {
+                    info!(
+                        dmabuf_cache_entries = cache_len,
+                        width = size.w,
+                        height = size.h,
+                        "smithay dmabuf cache insert"
+                    );
+                });
+            }
             Ok(texture)
         })
     }
