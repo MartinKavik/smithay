@@ -12,7 +12,7 @@ use std::{
     ptr,
     rc::Rc,
     sync::{
-        atomic::{AtomicBool, AtomicPtr, Ordering},
+        atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
         mpsc::{self, Sender},
         Arc, Mutex, OnceLock, RwLock, RwLockWriteGuard, TryLockError,
     },
@@ -134,6 +134,128 @@ fn should_log_cache() -> bool {
     }
 }
 
+static GLES_TEXTURE_LIVE: AtomicUsize = AtomicUsize::new(0);
+static GLES_TEXTURE_BYTES: AtomicUsize = AtomicUsize::new(0);
+static GLES_RENDERBUFFER_LIVE: AtomicUsize = AtomicUsize::new(0);
+static GLES_RENDERBUFFER_BYTES: AtomicUsize = AtomicUsize::new(0);
+static GLES_BUFFER_LIVE: AtomicUsize = AtomicUsize::new(0);
+static GLES_EGLIMAGE_LIVE: AtomicUsize = AtomicUsize::new(0);
+static GLES_MAPPING_LIVE: AtomicUsize = AtomicUsize::new(0);
+static GLES_MAPPING_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+fn estimate_bytes_from_internal_format(
+    format: Option<ffi::types::GLenum>,
+    size: Size<i32, BufferCoord>,
+) -> usize {
+    let w = size.w.max(0) as usize;
+    let h = size.h.max(0) as usize;
+    if w == 0 || h == 0 {
+        return 0;
+    }
+    let bpp = format
+        .and_then(gl_internal_format_to_fourcc)
+        .and_then(get_bpp)
+        .unwrap_or(32);
+    w.saturating_mul(h).saturating_mul(bpp / 8)
+}
+
+fn estimate_bytes_from_gl_read(
+    format: ffi::types::GLenum,
+    layout: ffi::types::GLenum,
+    size: Size<i32, BufferCoord>,
+) -> usize {
+    let w = size.w.max(0) as usize;
+    let h = size.h.max(0) as usize;
+    if w == 0 || h == 0 {
+        return 0;
+    }
+    let bpp = gl_bpp(format, layout).unwrap_or(32);
+    w.saturating_mul(h).saturating_mul(bpp / 8)
+}
+
+pub(super) fn track_texture_alloc(
+    format: Option<ffi::types::GLenum>,
+    size: Size<i32, BufferCoord>,
+    egl_images: usize,
+) {
+    GLES_TEXTURE_LIVE.fetch_add(1, Ordering::Relaxed);
+    GLES_TEXTURE_BYTES.fetch_add(estimate_bytes_from_internal_format(format, size), Ordering::Relaxed);
+    if egl_images > 0 {
+        GLES_EGLIMAGE_LIVE.fetch_add(egl_images, Ordering::Relaxed);
+    }
+}
+
+pub(super) fn track_texture_drop(
+    format: Option<ffi::types::GLenum>,
+    size: Size<i32, BufferCoord>,
+    egl_images: usize,
+) {
+    GLES_TEXTURE_LIVE.fetch_sub(1, Ordering::Relaxed);
+    GLES_TEXTURE_BYTES.fetch_sub(estimate_bytes_from_internal_format(format, size), Ordering::Relaxed);
+    if egl_images > 0 {
+        GLES_EGLIMAGE_LIVE.fetch_sub(egl_images, Ordering::Relaxed);
+    }
+}
+
+pub(super) fn track_renderbuffer_alloc(
+    format: ffi::types::GLenum,
+    size: Size<i32, BufferCoord>,
+) {
+    GLES_RENDERBUFFER_LIVE.fetch_add(1, Ordering::Relaxed);
+    GLES_RENDERBUFFER_BYTES
+        .fetch_add(estimate_bytes_from_internal_format(Some(format), size), Ordering::Relaxed);
+}
+
+pub(super) fn track_renderbuffer_drop(
+    format: ffi::types::GLenum,
+    size: Size<i32, BufferCoord>,
+) {
+    GLES_RENDERBUFFER_LIVE.fetch_sub(1, Ordering::Relaxed);
+    GLES_RENDERBUFFER_BYTES
+        .fetch_sub(estimate_bytes_from_internal_format(Some(format), size), Ordering::Relaxed);
+}
+
+pub(super) fn track_buffer_alloc() {
+    GLES_BUFFER_LIVE.fetch_add(1, Ordering::Relaxed);
+    GLES_EGLIMAGE_LIVE.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(super) fn track_buffer_drop() {
+    GLES_BUFFER_LIVE.fetch_sub(1, Ordering::Relaxed);
+    GLES_EGLIMAGE_LIVE.fetch_sub(1, Ordering::Relaxed);
+}
+
+pub(super) fn track_mapping_alloc(
+    format: ffi::types::GLenum,
+    layout: ffi::types::GLenum,
+    size: Size<i32, BufferCoord>,
+) {
+    GLES_MAPPING_LIVE.fetch_add(1, Ordering::Relaxed);
+    GLES_MAPPING_BYTES.fetch_add(estimate_bytes_from_gl_read(format, layout, size), Ordering::Relaxed);
+}
+
+pub(super) fn track_mapping_drop(
+    format: ffi::types::GLenum,
+    layout: ffi::types::GLenum,
+    size: Size<i32, BufferCoord>,
+) {
+    GLES_MAPPING_LIVE.fetch_sub(1, Ordering::Relaxed);
+    GLES_MAPPING_BYTES.fetch_sub(estimate_bytes_from_gl_read(format, layout, size), Ordering::Relaxed);
+}
+
+fn resource_stats_snapshot() -> (usize, usize, usize, usize, usize, usize, usize, usize) {
+    (
+        GLES_TEXTURE_LIVE.load(Ordering::Relaxed),
+        GLES_TEXTURE_BYTES.load(Ordering::Relaxed),
+        GLES_RENDERBUFFER_LIVE.load(Ordering::Relaxed),
+        GLES_RENDERBUFFER_BYTES.load(Ordering::Relaxed),
+        GLES_BUFFER_LIVE.load(Ordering::Relaxed),
+        GLES_EGLIMAGE_LIVE.load(Ordering::Relaxed),
+        GLES_MAPPING_LIVE.load(Ordering::Relaxed),
+        GLES_MAPPING_BYTES.load(Ordering::Relaxed),
+    )
+}
+
 #[derive(Debug)]
 struct GlesBufferInner {
     dmabuf: WeakDmabuf,
@@ -143,8 +265,28 @@ struct GlesBufferInner {
     destruction_callback_sender: Sender<CleanupResource>,
 }
 
+impl GlesBufferInner {
+    fn new(
+        dmabuf: WeakDmabuf,
+        image: EGLImage,
+        rbo: ffi::types::GLuint,
+        fbo: ffi::types::GLuint,
+        destruction_callback_sender: Sender<CleanupResource>,
+    ) -> Self {
+        track_buffer_alloc();
+        Self {
+            dmabuf,
+            image,
+            rbo,
+            fbo,
+            destruction_callback_sender,
+        }
+    }
+}
+
 impl Drop for GlesBufferInner {
     fn drop(&mut self) {
+        track_buffer_drop();
         let _ = self
             .destruction_callback_sender
             .send(CleanupResource::FramebufferObject(self.fbo));
@@ -176,6 +318,25 @@ struct GlesRenderbufferInternal {
     destruction_callback_sender: Sender<CleanupResource>,
 }
 
+impl GlesRenderbufferInternal {
+    fn new(
+        rbo: ffi::types::GLuint,
+        format: ffi::types::GLenum,
+        has_alpha: bool,
+        size: Size<i32, BufferCoord>,
+        destruction_callback_sender: Sender<CleanupResource>,
+    ) -> Self {
+        track_renderbuffer_alloc(format, size);
+        Self {
+            rbo,
+            format,
+            has_alpha,
+            size,
+            destruction_callback_sender,
+        }
+    }
+}
+
 impl GlesRenderbuffer {
     /// Size of the renderbuffer
     pub fn size(&self) -> Size<i32, BufferCoord> {
@@ -195,6 +356,7 @@ impl GlesRenderbuffer {
 
 impl Drop for GlesRenderbufferInternal {
     fn drop(&mut self) {
+        track_renderbuffer_drop(self.format, self.size);
         let _ = self
             .destruction_callback_sender
             .send(CleanupResource::RenderbufferObject(self.rbo));
@@ -871,6 +1033,16 @@ impl GlesRenderer {
                 || before_buffers != after_buffers
                 || should_log_cache())
         {
+            let (
+                gles_textures_live,
+                gles_textures_bytes,
+                gles_renderbuffers_live,
+                gles_renderbuffers_bytes,
+                gles_buffers_live,
+                gles_egl_images_live,
+                gles_mappings_live,
+                gles_mappings_bytes,
+            ) = resource_stats_snapshot();
             self.span.in_scope(|| {
                 info!(
                     hard_purge,
@@ -879,6 +1051,14 @@ impl GlesRenderer {
                     after_dmabuf,
                     before_buffers,
                     after_buffers,
+                    gles_textures_live,
+                    gles_textures_bytes,
+                    gles_renderbuffers_live,
+                    gles_renderbuffers_bytes,
+                    gles_buffers_live,
+                    gles_egl_images_live,
+                    gles_mappings_live,
+                    gles_mappings_bytes,
                     "smithay gles cleanup cache stats"
                 );
             });
@@ -984,17 +1164,17 @@ impl ImportMemWl for GlesRenderer {
                         unsafe { self.gl.GenTextures(1, &mut tex) };
                         // new texture, upload in full
                         upload_full = true;
-                        let new = Arc::new(GlesTextureInternal {
-                            texture: tex,
-                            sync: RwLock::default(),
-                            format: Some(internal_format),
+                        let new = Arc::new(GlesTextureInternal::new(
+                            tex,
+                            RwLock::default(),
+                            Some(internal_format),
                             has_alpha,
-                            is_external: false,
-                            y_inverted: false,
-                            size: (width, height).into(),
-                            egl_images: None,
-                            destruction_callback_sender: self.gles_cleanup().sender.clone(),
-                        });
+                            false,
+                            false,
+                            (width, height).into(),
+                            None,
+                            self.gles_cleanup().sender.clone(),
+                        ));
                         if let Some(cache) = surface_lock.as_mut() {
                             cache.insert(id, new.clone());
                             if cache_log_enabled() && upload_full && should_log_cache() {
@@ -1164,17 +1344,17 @@ impl ImportMem for GlesRenderer {
             };
 
             // new texture, upload in full
-            GlesTextureInternal {
-                texture: tex,
+            GlesTextureInternal::new(
+                tex,
                 sync,
-                format: Some(internal),
+                Some(internal),
                 has_alpha,
-                is_external: false,
-                y_inverted: flipped,
+                false,
+                flipped,
                 size,
-                egl_images: None,
-                destruction_callback_sender: self.gles_cleanup().sender.clone(),
-            }
+                None,
+                self.gles_cleanup().sender.clone(),
+            )
         }));
 
         Ok(texture)
@@ -1305,21 +1485,21 @@ impl ImportEgl for GlesRenderer {
 
         let tex = self.import_egl_image(egl.image(0).unwrap(), egl.format == EGLFormat::External, None)?;
 
-        let texture = GlesTexture(Arc::new(GlesTextureInternal {
-            texture: tex,
-            sync: RwLock::default(),
-            format: match egl.format {
+        let texture = GlesTexture(Arc::new(GlesTextureInternal::new(
+            tex,
+            RwLock::default(),
+            match egl.format {
                 EGLFormat::RGB | EGLFormat::RGBA => Some(ffi::RGBA8),
                 EGLFormat::External => None,
                 _ => unreachable!("EGLBuffer currenly does not expose multi-planar buffers to us"),
             },
-            has_alpha: !matches!(egl.format, EGLFormat::RGB),
-            is_external: egl.format == EGLFormat::External,
-            y_inverted: egl.y_inverted,
-            size: egl.size,
-            egl_images: Some(egl.into_images()),
-            destruction_callback_sender: self.gles_cleanup().sender.clone(),
-        }));
+            !matches!(egl.format, EGLFormat::RGB),
+            egl.format == EGLFormat::External,
+            egl.y_inverted,
+            egl.size,
+            Some(egl.into_images()),
+            self.gles_cleanup().sender.clone(),
+        )));
 
         Ok(texture)
     }
@@ -1351,17 +1531,17 @@ impl ImportDma for GlesRenderer {
                 .map(|(internal, _, _)| internal)
                 .unwrap_or(ffi::RGBA8);
             let has_alpha = has_alpha(buffer.format().code);
-            let texture = GlesTexture(Arc::new(GlesTextureInternal {
-                texture: tex,
-                sync: RwLock::default(),
-                format: Some(format),
+            let texture = GlesTexture(Arc::new(GlesTextureInternal::new(
+                tex,
+                RwLock::default(),
+                Some(format),
                 has_alpha,
                 is_external,
-                y_inverted: buffer.y_inverted(),
-                size: buffer.size(),
-                egl_images: Some(vec![image]),
-                destruction_callback_sender: self.gles_cleanup().sender.clone(),
-            }));
+                buffer.y_inverted(),
+                buffer.size(),
+                Some(vec![image]),
+                self.gles_cleanup().sender.clone(),
+            )));
             self.dmabuf_cache.insert(buffer.weak(), texture.clone());
             if cache_log_enabled() && should_log_cache() {
                 let cache_len = self.dmabuf_cache.len();
@@ -1485,15 +1665,18 @@ impl ExportMem for GlesRenderer {
         };
 
         match err {
-            ffi::NO_ERROR => Ok(GlesMapping {
-                pbo,
-                format,
-                layout,
-                has_alpha,
-                size: region.size,
-                mapping: AtomicPtr::new(ptr::null_mut()),
-                destruction_callback_sender: self.gles_cleanup().sender.clone(),
-            }),
+            ffi::NO_ERROR => {
+                track_mapping_alloc(format, layout, region.size);
+                Ok(GlesMapping {
+                    pbo,
+                    format,
+                    layout,
+                    has_alpha,
+                    size: region.size,
+                    mapping: AtomicPtr::new(ptr::null_mut()),
+                    destruction_callback_sender: self.gles_cleanup().sender.clone(),
+                })
+            }
             ffi::INVALID_ENUM | ffi::INVALID_OPERATION => Err(GlesError::UnsupportedPixelFormat(fourcc)),
             _ => Err(GlesError::UnknownPixelFormat),
         }
@@ -1545,15 +1728,18 @@ impl ExportMem for GlesRenderer {
         };
 
         match err {
-            ffi::NO_ERROR => Ok(GlesMapping {
-                pbo,
-                format,
-                layout,
-                has_alpha: texture.0.has_alpha,
-                size: region.size,
-                mapping: AtomicPtr::new(ptr::null_mut()),
-                destruction_callback_sender: self.gles_cleanup().sender.clone(),
-            }),
+            ffi::NO_ERROR => {
+                track_mapping_alloc(format, layout, region.size);
+                Ok(GlesMapping {
+                    pbo,
+                    format,
+                    layout,
+                    has_alpha: texture.0.has_alpha,
+                    size: region.size,
+                    mapping: AtomicPtr::new(ptr::null_mut()),
+                    destruction_callback_sender: self.gles_cleanup().sender.clone(),
+                })
+            }
             ffi::INVALID_ENUM | ffi::INVALID_OPERATION => Err(GlesError::UnsupportedPixelFormat(fourcc)),
             _ => Err(GlesError::UnknownPixelFormat),
         }
@@ -1654,13 +1840,13 @@ impl Bind<Dmabuf> for GlesRenderer {
                             ffi_egl::DestroyImageKHR(**self.egl.display().get_display_handle(), image);
                             return Err(GlesError::FramebufferBindingError);
                         }
-                        let buf = GlesBuffer(Rc::new(GlesBufferInner {
-                            dmabuf: dmabuf.weak(),
+                        let buf = GlesBuffer(Rc::new(GlesBufferInner::new(
+                            dmabuf.weak(),
                             image,
                             rbo,
                             fbo,
-                            destruction_callback_sender: self.gles_cleanup().sender.clone(),
-                        }));
+                            self.gles_cleanup().sender.clone(),
+                        )));
 
                         self.buffers.push(buf.clone());
 
@@ -1800,13 +1986,13 @@ impl Offscreen<GlesRenderbuffer> for GlesRenderer {
                 .RenderbufferStorage(ffi::RENDERBUFFER, internal, size.w, size.h);
             self.gl.BindRenderbuffer(ffi::RENDERBUFFER, 0);
 
-            Ok(GlesRenderbuffer(Rc::new(GlesRenderbufferInternal {
+            Ok(GlesRenderbuffer(Rc::new(GlesRenderbufferInternal::new(
                 rbo,
-                format: internal,
+                internal,
                 has_alpha,
                 size,
-                destruction_callback_sender: self.gles_cleanup().sender.clone(),
-            })))
+                self.gles_cleanup().sender.clone(),
+            ))))
         }
     }
 }

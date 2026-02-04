@@ -27,17 +27,17 @@ impl GlesTexture {
         tex: ffi::types::GLuint,
         size: Size<i32, BufferCoord>,
     ) -> GlesTexture {
-        GlesTexture(Arc::new(GlesTextureInternal {
-            texture: tex,
-            sync: RwLock::default(),
-            format: internal_format,
-            has_alpha: !opaque,
-            is_external: false,
-            y_inverted: false,
+        GlesTexture(Arc::new(GlesTextureInternal::new(
+            tex,
+            RwLock::default(),
+            internal_format,
+            !opaque,
+            false,
+            false,
             size,
-            egl_images: None,
-            destruction_callback_sender: renderer.gles_cleanup().sender.clone(),
-        }))
+            None,
+            renderer.gles_cleanup().sender.clone(),
+        )))
     }
 
     /// OpenGL texture id of this texture
@@ -135,8 +135,38 @@ pub(super) struct GlesTextureInternal {
 unsafe impl Send for GlesTextureInternal {}
 unsafe impl Sync for GlesTextureInternal {}
 
+impl GlesTextureInternal {
+    pub(super) fn new(
+        texture: ffi::types::GLuint,
+        sync: RwLock<TextureSync>,
+        format: Option<ffi::types::GLenum>,
+        has_alpha: bool,
+        is_external: bool,
+        y_inverted: bool,
+        size: Size<i32, BufferCoord>,
+        egl_images: Option<Vec<EGLImage>>,
+        destruction_callback_sender: Sender<CleanupResource>,
+    ) -> Self {
+        let egl_images_len = egl_images.as_ref().map(|images| images.len()).unwrap_or(0);
+        track_texture_alloc(format, size, egl_images_len);
+        Self {
+            texture,
+            sync,
+            format,
+            has_alpha,
+            is_external,
+            y_inverted,
+            size,
+            egl_images,
+            destruction_callback_sender,
+        }
+    }
+}
+
 impl Drop for GlesTextureInternal {
     fn drop(&mut self) {
+        let egl_images_len = self.egl_images.as_ref().map(|images| images.len()).unwrap_or(0);
+        track_texture_drop(self.format, self.size, egl_images_len);
         let _ = self
             .destruction_callback_sender
             .send(CleanupResource::Texture(self.texture));
@@ -223,6 +253,7 @@ impl TextureMapping for GlesMapping {
 
 impl Drop for GlesMapping {
     fn drop(&mut self) {
+        track_mapping_drop(self.format, self.layout, self.size);
         let _ = self.destruction_callback_sender.send(CleanupResource::Mapping(
             self.pbo,
             self.mapping.load(Ordering::SeqCst),
