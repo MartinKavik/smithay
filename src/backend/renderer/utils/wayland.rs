@@ -141,6 +141,20 @@ impl PartialEq<WlBuffer> for &Buffer {
 }
 
 impl RendererSurfaceState {
+    /// Drop any cached renderer textures for this surface.
+    ///
+    /// Useful when a surface is being destroyed or when you want to force re-import.
+    pub fn clear_textures(&mut self) {
+        self.textures.clear();
+    }
+
+    /// Reset the surface state and drop cached textures/buffer metadata.
+    ///
+    /// Intended for surface destruction paths.
+    pub fn reset_surface(&mut self) {
+        self.reset();
+    }
+
     #[profiling::function]
     pub(crate) fn update_buffer(&mut self, states: &SurfaceData) {
         #[cfg(feature = "backend_drm")]
