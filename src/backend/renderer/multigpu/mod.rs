@@ -1580,11 +1580,14 @@ where
     }
 }
 
+/// Type stored in surface `data_map` for multi-GPU texture tracking.
+pub(crate) type MultiTextureUserData = Arc<Mutex<MultiTextureInternal>>;
+
 /// [`Texture`]s produced by a [`MultiRenderer`].
 #[derive(Debug, Clone)]
 pub struct MultiTexture(Arc<Mutex<MultiTextureInternal>>);
 #[derive(Debug)]
-struct MultiTextureInternal {
+pub(crate) struct MultiTextureInternal {
     textures: HashMap<ErasedContextId, GpuSingleTexture>,
     size: Size<i32, BufferCoords>,
     format: Option<Fourcc>,
@@ -1594,6 +1597,13 @@ struct MultiTextureInternal {
 // SAFETY: We require `Send` for textures of renderers suitable for the MultiRenderer.
 //  Type erasure just forces us to do this instead.
 unsafe impl Send for MultiTextureInternal {}
+
+impl MultiTextureInternal {
+    /// Clear all cached textures, releasing GPU resources.
+    pub(crate) fn clear_textures(&mut self) {
+        self.textures.clear();
+    }
+}
 
 type DamageAnyTextureMappings = Vec<(Rectangle<i32, BufferCoords>, Box<dyn Any + 'static>)>;
 
@@ -1624,7 +1634,7 @@ impl MultiTexture {
             .and_then(|surface| {
                 surface
                     .data_map
-                    .get::<Arc<Mutex<MultiTextureInternal>>>()
+                    .get::<MultiTextureUserData>()
                     .cloned()
             })
             .unwrap_or_else(|| {

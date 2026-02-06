@@ -404,6 +404,11 @@ pub fn on_commit_buffer_handler<D: 'static>(surface: &WlSurface) {
                     {
                         state.reset();
                     }
+                    // Force-clear textures inside MultiTextureInternal to free GPU resources
+                    // even if the Arc stays alive (WlSurface handles may outlive the surface)
+                    if let Some(data) = data.data_map.get::<crate::backend::renderer::multigpu::MultiTextureUserData>() {
+                        data.lock().unwrap().clear_textures();
+                    }
                 });
             });
         }
